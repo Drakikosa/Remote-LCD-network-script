@@ -1,0 +1,678 @@
+/* 
+ * FIX and UPDATED by SH33P Rev 1.0 
+ * Remote LCD network script Rev 5/3/17 Jerry060599 
+ * German Translate by Drakikosa Sansibar
+ *  
+ *  
+ * Mit diesem Skript kann man Informationen die sich auf LCD`s befinden übertragen auf andere LCD`s 
+ * So kann man zum Beispiel Informationen die sich auf anderen Schiffen angezeigt werden in der Basis ansehen.
+ * 
+ * Das Skript ist vollständig Kompatibel zu anderen LCD Skripts
+ * 
+ *  
+ * Einstellung: 
+ * 1. Platzieren Sie einen Programmierblock auf beiden Schiffen.
+ * 2. Platzieren Sie eine Antenne auf beiden Schiffen.
+ * 3. Kennzeichnen Sie das Display, das Sie übertragen möchten [SEND: NAME]. Der Name ist frei wählbar. Leerzeichen werden ignoriert!
+ * 4. Kennzeichnen Sie das Display, wo Sie enpfangen möchten [RCV: NAME]. Nutzen sie den selben Namen den sie beim Sendenen Display gewählt haben.
+ * 5. (Optional) Markieren Sie ein Display [LCD_RELAY], um Statusaktualisierungen zu erhalten
+ *  
+ */
+
+        //Benutzereinstellungen 
+        static readonly string radioTag = "[LCD_RELAY]";//Die Kennzeichnung für Statusanzeige und Antennen
+        string receiveFromGrid = "";//Zeigen Sie sich ein bestimmtes Schiff an. Alle anderen Schiffe werden ignoriert. Machen Sie es leer, um alle zu zeigen.
+        string relayTo = "";//Nicht mehr Benötigt!
+
+        //Scripteinstellungen. Nicht verändern! 
+        static readonly string rcvTag = @"((\[RCV:){1}\w+\])+";
+        static readonly string sendTag = @"((\[SEND:){1}\w+\])+";
+        readonly char[] DELIMITER = new char[] { (char)31 };
+        readonly string PACKET_HEADER = "LCD_TRANSMITION";
+        Dictionary<string, List<Screen>> rcvPanels = new Dictionary<string, List<Screen>>();
+        List<Screen> sendPanels = new List<Screen>();
+        List<IMyTextPanel> statPanels = new List<IMyTextPanel>();
+        List<IMyTerminalBlock> list = new List<IMyTerminalBlock>();
+        DateTime lastPacket = DateTime.Now;
+        string lastRun = "";
+        string lastGrid = "NO DATA";
+        int lastSize = 0, lastSentSize = 0;
+        float lastRadius = 0;
+        Vector3 lastPos = new Vector3(0);
+
+        string _broadCastTag = "Messege_Broadcast";
+        IMyBroadcastListener _myBroadcastListener;
+
+        public Program()
+        {
+            _myBroadcastListener = IGC.RegisterBroadcastListener(_broadCastTag);
+            Runtime.UpdateFrequency = UpdateFrequency.Update100;
+            if (relayTo.Length == 0)
+            {
+                receiveFromGrid = receiveFromGrid.Trim();
+                ScreenFormatter.Init();
+                rescan();
+            }
+            Me.CustomName = "Skript   |   Remote LCD Network";
+        }
+
+        public void Main(string args, UpdateType updateSource)
+        {
+            Echo("Revision 1.0");
+            rescan();
+
+            lastRun = DateTime.Now.ToString("hh:mm:ss tt");
+            //Broadcast screens 
+            if (args.Length == 0 && sendPanels.Count() != 0)
+            {
+                IMyRadioAntenna radio = null;
+                float maxR = 0;
+
+                GridTerminalSystem.GetBlocksOfType<IMyRadioAntenna>(list, r => { if (radio == null && r.IsWorking && maxR < (r as IMyRadioAntenna).Radius) { radio = r as IMyRadioAntenna; maxR = radio.Radius; } return false; });
+                if (radio == null)
+                    Echo("No radio found! ");
+
+                StringBuilder sb = new StringBuilder();
+                sb.Append(PACKET_HEADER);
+                sb.Append(DELIMITER);
+                sb.Append(Me.CubeGrid.CustomName.Trim());
+                sb.Append(DELIMITER);
+                Vector3 pos = Me.CubeGrid.GetPosition();
+                sb.Append(pos.X);
+                sb.Append(DELIMITER);
+                sb.Append(pos.Y);
+                sb.Append(DELIMITER);
+                sb.Append(pos.Z);
+                sb.Append(DELIMITER);
+                sb.Append(radio == null ? float.NaN : radio.Radius);
+                sb.Append(DELIMITER);
+                foreach (Screen scrn in sendPanels)
+                {
+                    sb.Append(scrn.tag);
+                    sb.Append(DELIMITER);
+                    sb.Append(scrn.panel.GetText());
+                    sb.Append(DELIMITER);
+                    sb.Append(scrn.panel.GetValueFloat("FontSize"));
+                    sb.Append(DELIMITER);
+                    sb.Append(scrn.panel.GetValue<long>("Font"));
+                    sb.Append(DELIMITER);
+                    Echo("SENDING: " + scrn.tag);
+                }
+                lastSentSize = sb.Length;              
+                IGC.SendBroadcastMessage(_broadCastTag, sb.ToString());
+            }
+            if (_myBroadcastListener.HasPendingMessage)
+            {
+                Echo("Messege in queue");
+                MyIGCMessage myIGCMessage = _myBroadcastListener.AcceptMessage();
+                if (myIGCMessage.Tag == _broadCastTag)
+                {
+
+                    if (myIGCMessage.Data is string)
+                    {
+                        Echo("Received IGC Public Message");
+                        Echo("Tag=" + myIGCMessage.Tag);
+                        Echo("Source=" + myIGCMessage.Source.ToString("X"));
+
+                        String data = myIGCMessage.Data.ToString();
+
+                        if (relayTo.Length != 0)
+                        {
+                            IMyLaserAntenna laser = GridTerminalSystem.GetBlockWithName(relayTo) as IMyLaserAntenna;
+                            Echo("Relaying transmittion to " + relayTo + " at " + DateTime.Now.ToString("hh:mm:ss tt") + ".");
+                            if (laser == null)
+                                Echo("Error: Laser not found.");
+                            else
+                                IGC.SendBroadcastMessage(_broadCastTag, data);
+                            return;
+                        }
+
+                        if (data.Length != 0 && data.StartsWith(PACKET_HEADER + DELIMITER[0] + (receiveFromGrid.Length == 0 ? "" : receiveFromGrid + DELIMITER[0])))
+                        {
+                            try
+                            {
+                                string[] arr = data.Split(DELIMITER, StringSplitOptions.RemoveEmptyEntries);
+                                Echo("I length:" + arr.Length.ToString());
+                                for (int i = 6; i < arr.Length; i += 4)
+                                    if (rcvPanels.ContainsKey(arr[i]))
+                                        foreach (Screen scrn in rcvPanels[arr[i]])
+                                        {
+                                            scrn.panel.WriteText(arr[i + 1]);
+                                            scrn.panel.SetValueFloat("FontSize", float.Parse(arr[i + 2]));
+                                            scrn.panel.SetValue<long>("Font", long.Parse(arr[i + 3]));
+                                            Echo("RECEIVED: " + scrn.tag);
+                                        }
+                                lastGrid = arr[1];
+                                lastPos.X = float.Parse(arr[2]);
+                                lastPos.Y = float.Parse(arr[3]);
+                                lastPos.Z = float.Parse(arr[4]);
+                                lastRadius = float.Parse(arr[5]);
+                                lastSize = data.Length;
+                                lastPacket = DateTime.Now;
+                            }
+                            catch (Exception ex)
+                            {
+                                Echo("Corrupted packet received! Please make sure receiver and transmitter versions are the same.");
+                                lastSize = 0;
+                                lastGrid = "Corrupt Packet";
+                                Echo(ex.ToString());
+                            }
+                        }
+                    }
+                }
+            }            
+            //Output status screen 
+            updateLcd();
+        }
+        public void updateLcd()
+        {
+            if (statPanels.Count() == 0)
+                return;
+            ScreenFormatter sf = new ScreenFormatter(2);
+            sf.SetFill(1, 1);
+            sf.SetAlign(1, 1);
+            sf.Add(0, "Last Run:", true);
+            sf.Add(1, lastRun);
+            sf.Add(0, "Listen For:", true);
+            sf.Add(1, receiveFromGrid.Length == 0 ? "ALL" : receiveFromGrid);
+
+            sf.AddBlankRow();
+
+            sf.Add(0, "Last Packet RCV:", true);
+            sf.Add(1, string.Format("{0:#####0.0#}", (DateTime.Now - lastPacket).TotalSeconds) + " sec");
+            sf.Add(0, "Packet From:", true);
+            sf.Add(1, lastGrid, true);
+            sf.Add(0, "X", true);
+            sf.Add(1, "" + lastPos.X);
+            sf.Add(0, "Y:", true);
+            sf.Add(1, "" + lastPos.Y);
+            sf.Add(0, "Z:", true);
+            sf.Add(1, "" + lastPos.Z);
+            sf.Add(0, "Distance:", true);
+            sf.Add(1, string.Format("{0:#,0.0#}", (lastPos - Me.CubeGrid.GetPosition()).Length()) + " m");
+            sf.Add(0, "Broadcast Dis:", true);
+            sf.Add(1, string.Format("{0:#,0.0#}", lastRadius) + " m");
+            sf.Add(0, "Packet RCV Size:", true);
+            sf.Add(1, string.Format("{0:#,0}", lastSize) + " byte");
+            sf.Add(0, "Packet Sent Size:", true);
+            sf.Add(1, string.Format("{0:#,0}", lastSentSize) + " byte");
+            foreach (IMyTextPanel lcd in statPanels)
+                WriteTableToPanel("Radio status", sf, lcd);
+        }
+        public void rescan()
+        {
+            rcvPanels.Clear();
+            sendPanels.Clear();
+            statPanels.Clear();
+            GridTerminalSystem.GetBlocksOfType<IMyTextPanel>(list, r =>
+            {
+                if (r.CustomName.Contains(radioTag))
+                    statPanels.Add(r as IMyTextPanel);
+                else
+                {
+                    Screen scrn = Screen.tryParse(r as IMyTextPanel);
+                    if (scrn.isValid)
+                    {
+                        if (scrn.type == Screen.SEND)
+                            sendPanels.Add(scrn);
+                        else if (scrn.type == Screen.RECEIVE)
+                            if (rcvPanels.ContainsKey(scrn.tag))
+                                rcvPanels[scrn.tag].Add(scrn);
+                            else
+                            {
+                                List<Screen> arr = new List<Screen>();
+                                arr.Add(scrn);
+                                rcvPanels.Add(scrn.tag, arr);
+                            }
+                        scrn.panel.ContentType = ContentType.TEXT_AND_IMAGE;
+                        //scrn.panel.ShowPublicTextOnScreen();
+                    }
+                }
+                return false;
+            });
+        }
+        public struct Screen
+        {
+            public static readonly Screen invalid = new Screen(null, "", 0, false);
+            public static readonly byte RECEIVE = 0, SEND = 1;
+            public IMyTextPanel panel;
+            public string tag;
+            public byte type;
+            public bool isValid;
+            private Screen(IMyTextPanel a, string b, byte c, bool d = true)
+            {
+                panel = a;
+                tag = b;
+                type = c;
+                isValid = d;
+            }
+            public static Screen tryParse(IMyTextPanel p)
+            {
+                string name = p.CustomName.Replace(" ", "");
+                System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(name, rcvTag);
+                if (match.Success)
+                    return new Screen(p, name.Substring(match.Index + 5, match.Length - 6), RECEIVE);
+                else if ((match = System.Text.RegularExpressions.Regex.Match(name, sendTag)).Success)
+                    return new Screen(p, name.Substring(match.Index + 6, match.Length - 7), SEND);
+                return invalid;
+            }
+        }
+
+        //Alles Nachfolgende, geschrieben von taleden von TIM, verwendet mit Genehmigung von taleden für die Formatierung von LCD-Statusanzeigen.
+
+        public void WriteTableToPanel(string title, ScreenFormatter sf, IMyTextPanel panel, string before = "", string after = "")
+        {
+            int spanx, spany, wide, size, width, height;
+            int x, y;
+            float fontsize;
+
+            //Holen Sie sich die Spannweiten, falls vorhanden
+            wide = panel.BlockDefinition.SubtypeName.EndsWith("Wide") ? 2 : 1;
+            size = panel.BlockDefinition.SubtypeName.StartsWith("Small") ? 3 : 1;
+            spanx = spany = 1;
+            //Reduzieren Sie die Schriftgröße, um alles anzupassen 
+            x = sf.GetMinWidth();
+            x = (x / spanx) + ((x % spanx > 0) ? 1 : 0);
+            y = sf.GetNumRows();
+            y = (y / spany) + ((y % spany > 0) ? 1 : 0);
+            width = 658 * wide; // TODO monospace 26x17.5 chars 
+            fontsize = panel.GetValueFloat("FontSize");
+            if (fontsize < 0.25f)
+                fontsize = 1.0f;
+            if (x > 0)
+                fontsize = Math.Min(fontsize, Math.Max(0.5f, (float)(width * 100 / x) / 100.0f));
+            if (y > 0)
+                fontsize = Math.Min(fontsize, Math.Max(0.5f, (float)(1760 / y) / 100.0f));
+            //Berechnen Sie, wie viel Platz auf jedem Panel verfügbar ist
+            width = (int)((float)width / fontsize);
+            height = (int)(17.6f / fontsize);
+            panel.SetValueFloat("FontSize", fontsize);
+            panel.WritePublicTitle(title, false);
+            panel.WriteText(before + sf.ToString(width) + after, false);
+            //panel.ShowPublicTextOnScreen();
+            panel.ContentType = ContentType.TEXT_AND_IMAGE;
+        } // WriteTableToPanel() 
+        public class ScreenFormatter
+        {
+            private static Dictionary<char, byte> charWidth = new Dictionary<char, byte>();
+            private static Dictionary<string, int> textWidth = new Dictionary<string, int>();
+            private static byte SZ_SPACE;
+            private static byte SZ_SHYPH;
+
+            public static int GetWidth(string text, bool memoize = false)
+            {
+                int width;
+                if (!textWidth.TryGetValue(text, out width))
+                {
+                    //das ist nicht schneller (wahrscheinlich langsamer), aber es ist weniger "komplex"
+                    //gemäß der Silly Branch Count-Metrik von SE
+                    Dictionary<char, byte> cW = charWidth;
+                    string t = text + "\0\0\0\0\0\0\0";
+                    int i = t.Length - (t.Length % 8);
+                    byte w0, w1, w2, w3, w4, w5, w6, w7;
+                    while (i > 0)
+                    {
+                        cW.TryGetValue(t[i - 1], out w0);
+                        cW.TryGetValue(t[i - 2], out w1);
+                        cW.TryGetValue(t[i - 3], out w2);
+                        cW.TryGetValue(t[i - 4], out w3);
+                        cW.TryGetValue(t[i - 5], out w4);
+                        cW.TryGetValue(t[i - 6], out w5);
+                        cW.TryGetValue(t[i - 7], out w6);
+                        cW.TryGetValue(t[i - 8], out w7);
+                        width += w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+                        i -= 8;
+                    }
+                    if (memoize)
+                        textWidth[text] = width;
+                }
+                return width;
+            } // GetWidth() 
+
+            public static string Format(string text, int width, out int unused, int align = -1, bool memoize = false)
+            {
+                int spaces, bars;
+
+                // '\u00AD' is a "soft hyphen" in UTF16 but Panels don't wrap lines so 
+                // it's just a wider space character ' ', useful for column alignment 
+                unused = width - GetWidth(text, memoize);
+                if (unused <= SZ_SPACE / 2)
+                    return text;
+                spaces = unused / SZ_SPACE;
+                bars = 0;
+                unused -= spaces * SZ_SPACE;
+                if (2 * unused <= SZ_SPACE + (spaces * (SZ_SHYPH - SZ_SPACE)))
+                {
+                    bars = Math.Min(spaces, (int)((float)unused / (SZ_SHYPH - SZ_SPACE) + 0.4999f));
+                    spaces -= bars;
+                    unused -= bars * (SZ_SHYPH - SZ_SPACE);
+                }
+                else if (unused > SZ_SPACE / 2)
+                {
+                    spaces++;
+                    unused -= SZ_SPACE;
+                }
+                if (align > 0)
+                    return new String(' ', spaces) + new String('\u00AD', bars) + text;
+                if (align < 0)
+                    return text + new String('\u00AD', bars) + new String(' ', spaces);
+                if ((spaces % 2) > 0 & (bars % 2) == 0)
+                    return new String(' ', spaces / 2) + new String('\u00AD', bars / 2) + text + new String('\u00AD', bars / 2) + new String(' ', spaces - (spaces / 2));
+                return new String(' ', spaces - (spaces / 2)) + new String('\u00AD', bars / 2) + text + new String('\u00AD', bars - (bars / 2)) + new String(' ', spaces / 2);
+            } // Format() 
+
+            public static string Format(double value, int width, out int unused)
+            {
+                int spaces, bars;
+                value = Math.Min(Math.Max(value, 0.0f), 1.0f);
+                spaces = width / SZ_SPACE;
+                bars = (int)(spaces * value + 0.5f);
+                unused = width - (spaces * SZ_SPACE);
+                return new String('I', bars) + new String(' ', spaces - bars);
+            } // Format() 
+
+            public static void Init()
+            {
+                InitChars(0, "\u2028\u2029\u202F");
+                InitChars(7, "'|\u00A6\u02C9\u2018\u2019\u201A");
+                InitChars(8, "\u0458");
+                InitChars(9, " !I`ijl\u00A0\u00A1\u00A8\u00AF\u00B4\u00B8\u00CC\u00CD\u00CE\u00CF\u00EC\u00ED\u00EE\u00EF\u0128\u0129\u012A\u012B\u012E\u012F\u0130\u0131\u0135\u013A\u013C\u013E\u0142\u02C6\u02C7\u02D8\u02D9\u02DA\u02DB\u02DC\u02DD\u0406\u0407\u0456\u0457\u2039\u203A\u2219");
+                InitChars(10, "(),.1:;[]ft{}\u00B7\u0163\u0165\u0167\u021B");
+                InitChars(11, "\"-r\u00AA\u00AD\u00BA\u0140\u0155\u0157\u0159");
+                InitChars(12, "*\u00B2\u00B3\u00B9");
+                InitChars(13, "\\\u00B0\u201C\u201D\u201E");
+                InitChars(14, "\u0491");
+                InitChars(15, "/\u0133\u0442\u044D\u0454");
+                InitChars(16, "L_vx\u00AB\u00BB\u0139\u013B\u013D\u013F\u0141\u0413\u0433\u0437\u043B\u0445\u0447\u0490\u2013\u2022");
+                InitChars(17, "7?Jcz\u00A2\u00BF\u00E7\u0107\u0109\u010B\u010D\u0134\u017A\u017C\u017E\u0403\u0408\u0427\u0430\u0432\u0438\u0439\u043D\u043E\u043F\u0441\u044A\u044C\u0453\u0455\u045C");
+                InitChars(18, "3FKTabdeghknopqsuy\u00A3\u00B5\u00DD\u00E0\u00E1\u00E2\u00E3\u00E4\u00E5\u00E8\u00E9\u00EA\u00EB\u00F0\u00F1\u00F2\u00F3\u00F4\u00F5\u00F6\u00F8\u00F9\u00FA\u00FB\u00FC\u00FD\u00FE\u00FF\u00FF\u0101\u0103\u0105\u010F\u0111\u0113\u0115\u0117\u0119\u011B\u011D\u011F\u0121\u0123\u0125\u0127\u0136\u0137\u0144\u0146\u0148\u0149\u014D\u014F\u0151\u015B\u015D\u015F\u0161\u0162\u0164\u0166\u0169\u016B\u016D\u016F\u0171\u0173\u0176\u0177\u0178\u0219\u021A\u040E\u0417\u041A\u041B\u0431\u0434\u0435\u043A\u0440\u0443\u0446\u044F\u0451\u0452\u045B\u045E\u045F");
+                InitChars(19, "+<=>E^~\u00AC\u00B1\u00B6\u00C8\u00C9\u00CA\u00CB\u00D7\u00F7\u0112\u0114\u0116\u0118\u011A\u0404\u040F\u0415\u041D\u042D\u2212");
+                InitChars(20, "#0245689CXZ\u00A4\u00A5\u00C7\u00DF\u0106\u0108\u010A\u010C\u0179\u017B\u017D\u0192\u0401\u040C\u0410\u0411\u0412\u0414\u0418\u0419\u041F\u0420\u0421\u0422\u0423\u0425\u042C\u20AC");
+                InitChars(21, "$&GHPUVY\u00A7\u00D9\u00DA\u00DB\u00DC\u00DE\u0100\u011C\u011E\u0120\u0122\u0124\u0126\u0168\u016A\u016C\u016E\u0170\u0172\u041E\u0424\u0426\u042A\u042F\u0436\u044B\u2020\u2021");
+                InitChars(22, "ABDNOQRS\u00C0\u00C1\u00C2\u00C3\u00C4\u00C5\u00D0\u00D1\u00D2\u00D3\u00D4\u00D5\u00D6\u00D8\u0102\u0104\u010E\u0110\u0143\u0145\u0147\u014C\u014E\u0150\u0154\u0156\u0158\u015A\u015C\u015E\u0160\u0218\u0405\u040A\u0416\u0444");
+                InitChars(23, "\u0459");
+                InitChars(24, "\u044E");
+                InitChars(25, "%\u0132\u042B");
+                InitChars(26, "@\u00A9\u00AE\u043C\u0448\u045A");
+                InitChars(27, "M\u041C\u0428");
+                InitChars(28, "mw\u00BC\u0175\u042E\u0449");
+                InitChars(29, "\u00BE\u00E6\u0153\u0409");
+                InitChars(30, "\u00BD\u0429");
+                InitChars(31, "\u2122");
+                InitChars(32, "W\u00C6\u0152\u0174\u2014\u2026\u2030");
+                SZ_SPACE = charWidth[' '];
+                SZ_SHYPH = charWidth['\u00AD'];
+            } // Init() 
+
+            private static void InitChars(byte width, string text)
+            {
+                // more silly loop-unrolling, as in GetWidth() 
+                Dictionary<char, byte> cW = charWidth;
+                string t = text + "\0\0\0\0\0\0\0";
+                byte w = Math.Max((byte)0, width);
+                int i = t.Length - (t.Length % 8);
+                while (i > 0)
+                {
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                    cW[t[--i]] = w;
+                }
+                cW['\0'] = 0;
+            } // InitChars() 
+
+            private int numCols;
+            private int numRows;
+            private int padding;
+            private List<string>[] colRowText;
+            private List<int>[] colRowWidth;
+            private int[] colAlign;
+            private int[] colFill;
+            private bool[] colBar;
+            private int[] colWidth;
+
+            public ScreenFormatter(int numCols, int padding = 1)
+            {
+                this.numCols = numCols;
+                this.numRows = 0;
+                this.padding = padding;
+                this.colRowText = new List<string>[numCols];
+                this.colRowWidth = new List<int>[numCols];
+                this.colAlign = new int[numCols];
+                this.colFill = new int[numCols];
+                this.colBar = new bool[numCols];
+                this.colWidth = new int[numCols];
+                for (int c = 0; c < numCols; c++)
+                {
+                    this.colRowText[c] = new List<string>();
+                    this.colRowWidth[c] = new List<int>();
+                    this.colAlign[c] = -1;
+                    this.colFill[c] = 0;
+                    this.colBar[c] = false;
+                    this.colWidth[c] = 0;
+                }
+            } // ScreenFormatter() 
+
+            public void Add(int col, string text, bool memoize = false)
+            {
+                int width = 0;
+                this.colRowText[col].Add(text);
+                if (this.colBar[col] == false)
+                {
+                    width = GetWidth(text, memoize);
+                    this.colWidth[col] = Math.Max(this.colWidth[col], width);
+                }
+                this.colRowWidth[col].Add(width);
+                this.numRows = Math.Max(this.numRows, this.colRowText[col].Count);
+            } // Add() 
+
+            public void AddBlankRow()
+            {
+                for (int c = 0; c < this.numCols; c++)
+                {
+                    this.colRowText[c].Add("");
+                    this.colRowWidth[c].Add(0);
+                }
+                this.numRows++;
+            } // AddBlankRow() 
+
+            public int GetNumRows()
+            {
+                return this.numRows;
+            } // GetNumRows() 
+
+            public int GetMinWidth()
+            {
+                int width = this.padding * SZ_SPACE;
+                for (int c = 0; c < this.numCols; c++)
+                    width += this.padding * SZ_SPACE + this.colWidth[c];
+                return width;
+            } // GetMinWidth() 
+
+            public void SetAlign(int col, int align)
+            {
+                this.colAlign[col] = align;
+            } // SetAlign() 
+
+            public void SetFill(int col, int fill = 1)
+            {
+                this.colFill[col] = fill;
+            } // SetFill() 
+
+            public void SetBar(int col, bool bar = true)
+            {
+                this.colBar[col] = bar;
+            } // SetBar() 
+
+            public void SetWidth(int col, int width)
+            {
+                this.colWidth[col] = width;
+            } // SetWidth() 
+
+            public string[][] ToSpan(int width = 0, int span = 1)
+            {
+                int c, r, s, i, j, textwidth, unused, remaining;
+                int[] colWidth;
+                byte w;
+                double value;
+                string text;
+                StringBuilder sb;
+                string[][] spanLines;
+
+                // clone the user-defined widths and tally fill columns 
+                colWidth = (int[])this.colWidth.Clone();
+                unused = width * span - this.padding * SZ_SPACE;
+                remaining = 0;
+                for (c = 0; c < this.numCols; c++)
+                {
+                    unused -= this.padding * SZ_SPACE;
+                    if (this.colFill[c] == 0)
+                        unused -= colWidth[c];
+                    remaining += this.colFill[c];
+                }
+
+                // distribute remaining width to fill columns 
+                for (c = 0; c < this.numCols & remaining > 0; c++)
+                {
+                    if (this.colFill[c] > 0)
+                    {
+                        colWidth[c] = Math.Max(colWidth[c], this.colFill[c] * unused / remaining);
+                        unused -= colWidth[c];
+                        remaining -= this.colFill[c];
+                    }
+                }
+
+                // initialize output arrays 
+                spanLines = new string[span][];
+                for (s = 0; s < span; s++)
+                    spanLines[s] = new string[this.numRows];
+                span--; // make "span" inclusive so "s < span" implies one left 
+
+                // render all rows and columns 
+                i = 0;
+                sb = new StringBuilder();
+                for (r = 0; r < this.numRows; r++)
+                {
+                    sb.Clear();
+                    s = 0;
+                    remaining = width;
+                    unused = 0;
+                    for (c = 0; c < this.numCols; c++)
+                    {
+                        unused += this.padding * SZ_SPACE;
+                        if (r >= this.colRowText[c].Count || colRowText[c][r] == "")
+                        {
+                            unused += colWidth[c];
+                        }
+                        else
+                        {
+                            // render the bar, or fetch the cell text 
+                            text = this.colRowText[c][r];
+                            charWidth.TryGetValue(text[0], out w);
+                            textwidth = this.colRowWidth[c][r];
+                            if (this.colBar[c] == true)
+                            {
+                                value = 0.0;
+                                if (double.TryParse(text, out value))
+                                    value = Math.Min(Math.Max(value, 0.0), 1.0);
+                                i = (int)((colWidth[c] / SZ_SPACE) * value + 0.5);
+                                w = SZ_SPACE;
+                                textwidth = i * SZ_SPACE;
+                            }
+
+                            // if the column is not left-aligned, calculate left spacing 
+                            if (this.colAlign[c] > 0)
+                            {
+                                unused += (colWidth[c] - textwidth);
+                            }
+                            else if (this.colAlign[c] == 0)
+                            {
+                                unused += (colWidth[c] - textwidth) / 2;
+                            }
+
+                            // while the left spacing leaves no room for text, adjust it 
+                            while (s < span & unused > remaining - w)
+                            {
+                                sb.Append(' ');
+                                spanLines[s][r] = sb.ToString();
+                                sb.Clear();
+                                s++;
+                                unused -= remaining;
+                                remaining = width;
+                            }
+
+                            // add left spacing 
+                            remaining -= unused;
+                            sb.Append(Format("", unused, out unused));
+                            remaining += unused;
+
+                            // if the column is not right-aligned, calculate right spacing 
+                            if (this.colAlign[c] < 0)
+                            {
+                                unused += (colWidth[c] - textwidth);
+                            }
+                            else if (this.colAlign[c] == 0)
+                            {
+                                unused += (colWidth[c] - textwidth) - ((colWidth[c] - textwidth) / 2);
+                            }
+
+                            // while the bar or text runs to the next span, split it 
+                            if (this.colBar[c] == true)
+                            {
+                                while (s < span & textwidth > remaining)
+                                {
+                                    j = remaining / SZ_SPACE;
+                                    remaining -= j * SZ_SPACE;
+                                    textwidth -= j * SZ_SPACE;
+                                    sb.Append(new String('I', j));
+                                    spanLines[s][r] = sb.ToString();
+                                    sb.Clear();
+                                    s++;
+                                    unused -= remaining;
+                                    remaining = width;
+                                    i -= j;
+                                }
+                                text = new String('I', i);
+                            }
+                            else
+                            {
+                                while (s < span & textwidth > remaining)
+                                {
+                                    i = 0;
+                                    while (remaining >= w)
+                                    {
+                                        remaining -= w;
+                                        textwidth -= w;
+                                        charWidth.TryGetValue(text[++i], out w);
+                                    }
+                                    sb.Append(text, 0, i);
+                                    spanLines[s][r] = sb.ToString();
+                                    sb.Clear();
+                                    s++;
+                                    unused -= remaining;
+                                    remaining = width;
+                                    text = text.Substring(i);
+                                }
+                            }
+
+                            // add cell text 
+                            remaining -= textwidth;
+                            sb.Append(text);
+                        }
+                    }
+                    spanLines[s][r] = sb.ToString();
+                }
+
+                return spanLines;
+            } // ToSpan() 
+
+            public string ToString(int width = 0)
+            {
+                return String.Join("\n", this.ToSpan(width, 1)[0]);
+            } // ToString() 
+
+        } // ScreenFormatter
